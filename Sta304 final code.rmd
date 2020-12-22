@@ -1,0 +1,459 @@
+---
+title: "Analysing the result of 2019 Canadian Federal Election using MRP retrospectively"
+author: "Zilong Yi"
+date: "December 21st, 2020"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE, message=FALSE}
+library(tidyverse)
+library(lme4)
+library(ROCR)
+library(tidybayes)
+library(caret)
+library(pROC)
+library(survey)
+
+
+# Loading in the cleaned survey Data
+original_survey_data <- read.delim("survey_data.tab")
+
+survey_data <- original_survey_data %>% select(q11, q2, q3, q4, q61, q69)
+
+
+## Data frame for liberal#
+survey_data_liberal <- survey_data %>% 
+  rename(vote_for_liberal = q11,
+         age = q2,
+         sex = q3,
+         education = q61,
+         income_family = q69,
+         province = q4
+)
+
+#Ignore sex == 3. i.e sex == 'other'
+survey_data_liberal <- subset(survey_data_liberal, sex != 3)
+
+#Data cleaning
+survey_data_liberal <- survey_data_liberal %>% 
+  mutate(age = 2019 - age,
+         sex = case_when(sex == 1 ~ 'Male',
+                             sex == 2 ~ 'Female'),
+         education = case_when(education >= 0 & education < 5  ~ "Less than high school diploma or its equivalent",
+                                education == 5 ~ "High school diploma or a high school equivalency certificate",
+                                education > 5 & education < 8  ~ 
+                                 "College, CEGEP or other non-university certificate or di...",
+                                education == 8 ~ "University certificate or diploma below the bachelor's level",
+                                education == 9 ~ "Bachelor's degree (e.g. B.A., B.Sc., LL.B.)",
+                                education > 9 & education < 12 ~ 
+                                 "University certificate, diploma or degree above the bach...",
+                               education == -8|education == -9 ~ NA_character_
+                                ),
+         income_family = case_when(income_family > 0 & income_family < 25000 ~ "Less than $25,000",
+                                   income_family >= 25000 & income_family <= 49999 ~ "$25,000 to $49,999",
+                                   income_family >49999 & income_family <= 74999 ~ "$50,000 to $74,999",
+                                   income_family >74999 & income_family <= 99999 ~ "$75,000 to $99,999",
+                                   income_family >99999 & income_family <= 124999 ~ "$100,000 to $ 124,999",
+                                   income_family > 124999 ~ "$125,000 and more"),
+         province = case_when(province == 1 ~ "Newfoundland and Labrador",
+                              province == 2 ~ "Prince Edward Island",
+                              province == 3 ~ "Nova Scotia",
+                              province == 4 ~ "New Brunswick",
+                              province == 5 ~ "Quebec",
+                              province == 6 ~ "Ontario",
+                              province == 7 ~ "Manitoba",
+                              province == 8 ~ "Saskatchewan",
+                              province == 9 ~ "Alberta",
+                              province == 10 ~ "British Columbia"
+           
+         ),
+         vote_for_liberal = ifelse(vote_for_liberal == 1, 1, 0))
+
+#Ignore missing values
+survey_data_liberal <- na.omit(survey_data_liberal)
+
+#basic characteristics of CES 
+max(survey_data_liberal$age)
+min(survey_data_liberal$age)
+mean(survey_data_liberal$age)
+sd(survey_data_liberal$age)
+
+no_each_sex <- survey_data_liberal %>% count(sex)
+no_each_edu <- survey_data_liberal %>% count(education)
+no_each_income <- survey_data_liberal %>% count(income_family)
+ 
+rm(no_each_sex, no_each_edu, no_each_income)
+
+
+
+# create levels of age
+survey_data_liberal <- survey_data_liberal %>% 
+  mutate(age = case_when(age <= 25 ~'25 or less',
+                         age > 25 & age <= 40 ~ '26 to 40',
+                         age > 40 & age <= 55 ~ '40 to 55',
+                         age > 55 & age <= 70 ~ '55 to 70',
+                         age > 70 ~ 'Above 70'))
+
+
+
+# Loading in the cleaned census Data
+census_data <- read_csv("gss.csv")
+
+census_data_liberal <- census_data %>% select(age, sex, income_family, education, province)
+
+#Ignore age < 18. 
+census_data_liberal <- subset(census_data_liberal, age >= 18)
+
+#basic characteristics of gss 
+max(census_data_liberal$age)
+min(census_data_liberal$age)
+mean(census_data_liberal$age)
+sd(census_data_liberal$age)
+
+no_each_sex <- census_data_liberal %>% count(sex)
+no_each_edu <- census_data_liberal %>% count(education)
+no_each_income <- census_data_liberal %>% count(income_family)
+ 
+rm(no_each_sex, no_each_edu, no_each_income)
+
+
+## Census Data cleaning
+census_data_liberal <- census_data_liberal %>% 
+  mutate(age = case_when(age <= 25 ~'25 or less',
+                         age > 25 & age <= 40 ~ '26 to 40',
+                         age > 40 & age <= 55 ~ '40 to 55',
+                         age > 55 & age <= 70 ~ '55 to 70',
+                         age > 70 ~ 'Above 70'))
+
+census_data_liberal$education <- replace(census_data_liberal$education, census_data_liberal$education == 'Trade certificate or diploma', "College, CEGEP or other non-university certificate or di..." )
+
+#unique(survey_data_liberal$income_family)
+#unique(census_data_liberal$income_family)
+#unique(survey_data_liberal$education)
+#unique(census_data_liberal$education)
+
+
+# cells in dataset
+survey_data_liberal$cell<-paste(survey_data_liberal$sex,survey_data_liberal$income_family)
+census_data_liberal$cell<-paste(census_data_liberal$sex,census_data_liberal$income_family)
+
+#Convert variables to factors#
+f.cols.survey<-c('vote_for_liberal', 'age', 'sex', 'education', 'province', 'income_family','cell')
+survey_data_liberal[f.cols.survey] <- lapply(survey_data_liberal[f.cols.survey], factor) 
+f.cols.census<-c('age', 'sex', 'education', 'province', 'income_family','cell')
+census_data_liberal[f.cols.census] <- lapply(census_data_liberal[f.cols.census], factor)
+
+rm(f.cols.survey,f.cols.census)
+### Multi-level regression ###
+
+##model 1
+log_model_1 <- glm(vote_for_liberal ~ sex+education+age+income_family+province,
+                     data = survey_data_liberal,family="binomial")
+
+summary(log_model_1)
+model1_AIC <-AIC(log_model_1,k=2)
+model1_BIC <- BIC(log_model_1)
+model1_AICandBIC <- c(model1_AIC,model1_BIC)
+model1_AICandBIC
+
+p_model1<-predict(log_model_1,type=c('response'))
+final_model_1<-ifelse(p_model1>=0.5,"Liberal","Non-Liberal")
+result_liberal_1<-cbind(survey_data_liberal,final_model_1)
+
+#roc curve
+roc_model1 <- roc(result_liberal_1$vote_for_liberal, p_model1)
+auc(roc_model1)
+plot(roc_model1, auc.polygon=TRUE, print.auc = TRUE,asp = NA)
+
+##model 2
+log_model_2 <- glmer(vote_for_liberal ~ age+province+education+(1|cell),
+                     data = survey_data_liberal,family="binomial")
+
+summary(log_model_2)
+ranef(log_model_2)
+#plot(log_model_2)   
+
+p_model2<-predict(log_model_2,type=c('response'))
+
+final_model2<-ifelse(p_model2>=0.5,"Liberal","Non-liberal")
+result_liberal_2<-cbind(survey_data_liberal,final_model2)
+
+
+roc_model2 <- roc(result_liberal_2$vote_for_liberal, p_model2)
+auc(roc_model2)
+plot(roc_model2, auc.polygon=TRUE, print.auc = TRUE,asp = NA)
+
+
+prediciton_data_liberal <- census_data_liberal %>% 
+  count(cell, province, education, age) %>% 
+  group_by(cell)
+
+prediciton_data_liberal$estimate <- predict(log_model_2, prediciton_data_liberal, type='response')
+prediciton_data_liberal <- prediciton_data_liberal %>% mutate(cell_pro = n/ length(census_data_liberal$age))
+head(prediciton_data_liberal)
+prediciton_data_liberal <- prediciton_data_liberal %>% mutate(alp_predict = estimate*cell_pro)
+prediciton_data_liberal <- na.omit(prediciton_data_liberal)
+sum(prediciton_data_liberal$alp_predict)
+
+```
+
+
+
+```{r,include=FALSE, message=FALSE}
+# Loading in the cleaned survey Data
+original_survey_data <- read.delim("survey_data.tab")
+
+survey_data <- original_survey_data %>% select(q11, q2, q3, q4, q61, q69)
+
+
+## Data frame for liberal#
+survey_data_conservative <- survey_data %>% 
+  rename(vote_for_conservative = q11,
+         age = q2,
+         sex = q3,
+         education = q61,
+         income_family = q69,
+         province = q4
+)
+
+#Ignore sex == 3. i.e sex == 'other'
+survey_data_conservative <- subset(survey_data_conservative, sex != 3)
+
+#Data cleaning
+survey_data_conservative <- survey_data_conservative %>% 
+  mutate(age = 2019 - age,
+         sex = case_when(sex == 1 ~ 'Male',
+                             sex == 2 ~ 'Female'),
+         education = case_when(education >= 0 & education < 5  ~ "Less than high school diploma or its equivalent",
+                                education == 5 ~ "High school diploma or a high school equivalency certificate",
+                                education > 5 & education < 8  ~ 
+                                 "College, CEGEP or other non-university certificate or di...",
+                                education == 8 ~ "University certificate or diploma below the bachelor's level",
+                                education == 9 ~ "Bachelor's degree (e.g. B.A., B.Sc., LL.B.)",
+                                education > 9 & education < 12 ~ 
+                                 "University certificate, diploma or degree above the bach...",
+                               education == -8|education == -9 ~ NA_character_
+                                ),
+         income_family = case_when(income_family > 0 & income_family < 25000 ~ "Less than $25,000",
+                                   income_family >= 25000 & income_family <= 49999 ~ "$25,000 to $49,999",
+                                   income_family >49999 & income_family <= 74999 ~ "$50,000 to $74,999",
+                                   income_family >74999 & income_family <= 99999 ~ "$75,000 to $99,999",
+                                   income_family >99999 & income_family <= 124999 ~ "$100,000 to $ 124,999",
+                                   income_family > 124999 ~ "$125,000 and more"),
+         province = case_when(province == 1 ~ "Newfoundland and Labrador",
+                              province == 2 ~ "Prince Edward Island",
+                              province == 3 ~ "Nova Scotia",
+                              province == 4 ~ "New Brunswick",
+                              province == 5 ~ "Quebec",
+                              province == 6 ~ "Ontario",
+                              province == 7 ~ "Manitoba",
+                              province == 8 ~ "Saskatchewan",
+                              province == 9 ~ "Alberta",
+                              province == 10 ~ "British Columbia"
+           
+         ),
+         vote_for_conservative = ifelse(vote_for_conservative == 2, 1, 0))
+
+#Ignore missing values
+survey_data_conservative <- na.omit(survey_data_conservative)
+
+
+# create levels of age
+survey_data_conservative <- survey_data_conservative %>% 
+  mutate(age = case_when(age <= 25 ~'25 or less',
+                         age > 25 & age <= 40 ~ '26 to 40',
+                         age > 40 & age <= 55 ~ '40 to 55',
+                         age > 55 & age <= 70 ~ '55 to 70',
+                         age > 70 ~ 'Above 70'))
+
+
+
+# Loading in the cleaned census Data
+census_data <- read_csv("gss.csv")
+
+census_data_conservative <- census_data %>% select(age, sex, income_family, education, province)
+
+#Ignore age < 18. 
+census_data_conservative <- subset(census_data_conservative, age >= 18)
+
+
+
+## Census Data cleaning
+census_data_conservative <- census_data_conservative %>% 
+  mutate(age = case_when(age <= 25 ~'25 or less',
+                         age > 25 & age <= 40 ~ '26 to 40',
+                         age > 40 & age <= 55 ~ '40 to 55',
+                         age > 55 & age <= 70 ~ '55 to 70',
+                         age > 70 ~ 'Above 70'))
+
+census_data_conservative$education <- replace(census_data_conservative$education, census_data_conservative$education == 'Trade certificate or diploma', "College, CEGEP or other non-university certificate or di..." )
+
+
+
+# cells in dataset
+survey_data_conservative$cell<-paste(survey_data_conservative$sex,survey_data_conservative$income_family)
+census_data_conservative$cell<-paste(census_data_conservative$sex,census_data_conservative$income_family)
+
+#Convert variables to factors#
+f.cols.survey<-c('vote_for_conservative', 'age', 'sex', 'education', 'province', 'income_family','cell')
+survey_data_conservative[f.cols.survey] <- lapply(survey_data_conservative[f.cols.survey], factor) 
+f.cols.census<-c('age', 'sex', 'education', 'province', 'income_family','cell')
+census_data_conservative[f.cols.census] <- lapply(census_data_conservative[f.cols.census], factor)
+
+rm(f.cols.survey,f.cols.census)
+
+
+### Multi-level regression ###
+
+
+##model 3
+log_model_3 <- glmer(vote_for_conservative ~ age+province+education+(1|cell),
+                     data = survey_data_conservative,family="binomial")
+
+summary(log_model_3)
+ranef(log_model_3)
+#plot(log_model_2)   
+
+p_model3<-predict(log_model_3,type=c('response'))
+
+
+final_model3<-ifelse(p_model3>=0.5,"Conservative","Non-Conservative")
+result_conservative_2<-cbind(survey_data_conservative,final_model3)
+
+
+prediction_data_conservative <- census_data_conservative %>% 
+  count(cell, province, education, age) %>% 
+  group_by(cell)
+
+prediction_data_conservative$estimate <- predict(log_model_3, prediction_data_conservative, type='response')
+prediction_data_conservative <- prediction_data_conservative %>% mutate(cell_pro = n/ length(census_data_conservative$age))
+head(prediction_data_conservative)
+prediction_data_conservative <- prediction_data_conservative %>% mutate(alp_predict = estimate*cell_pro)
+prediction_data_conservative <- na.omit(prediction_data_conservative)
+sum(prediction_data_conservative$alp_predict)
+```
+###Abstract:
+2019 Canadian Federal Election came to an end a year ago. Statistics on election has suggested that the voter turnout was only 66% (Statistics Canada, 2019). Natural question to ask is that whether the result would be different if ‘everyone’ has voted. In this report, we will investigate this question using a method called Multi-level regression and post-stratification (MRP). We will describe what datasets are used and how we are going to apply MRP. We will also discuss a surprising result based on our datasets as well as limitation in this report and what can be done to improve in the future analysis. 
+
+###Keywords: 
+Non-representative polling, Multilevel regression and poststratification, Election retrospective forecasting
+
+###Introduction:
+Multilevel regression with post-stratification (MRP) is a widely used method to adapt non-representative samples to better analyse public opinion and other survey responses. The underlying assumption of MRP is that similar type of subjects shares similar views, such as vote intention. Also, poststratification would correct for known differences between sample and target populations (Little, 1993). Thus, it is often applied when census data does not contain variable of interests while information on population level is needed, e.g., prediction on Federal election across country. By collecting regional/non-representative samples and using them to build regression model to relate individual-level sample response to certain characteristics, regression model is then applied to census data to extrapolate population. In simple language, MRP uses information gathered from a relatively small dataset to extrapolate characteristics of population. In this way, MRP can not only allow a better understanding of responses, but also allow us to analyse on the population level economically and practically. 
+
+MRP was originally developed by Gelman and T. Little in 1997, building upon ideas of Fay and Herriot and R. Little. It is often used in prediction of presidential election. One well-known example would be that Wang et. al. used survey data from Xbox gamers to predict U.S. presidential election results. In this report, I will apply MRP to analyse result of 2019 Canadian Federal Election if ‘everyone’ has voted. This would demonstrate how well MRP would perform and also the flaw it might have. 
+
+Two datasets will be used, 2019 Canadian Election Study (CES) phone survey data and Canadian General Social Survey (GSS) dataset, in MRP, In the Methodology section (Section 2), I describe how CES and GSS are used and the regression model that was built. Results of MRP analysis are provided in the Results section (Section 3), and inferences of this data along with conclusions are presented in Conclusion section (Section 4).
+
+###Methodology:
+##Data:
+As mentioned in introduction section, two datasets, CES and GSS, are used in this report. Especially, CES dataset is used in the phase of multi-level regression, i.e., building models, while GSS dataset is used as a census dataset to actually “predict” the outcome of 2019 Canadian Federal Election. Table 1 outlines some baseline characteristics of two datasets. It should be noted that subjects with age less than 18 in GSS are omitted as they do not meet the criterion of voting in Canada. Also, two datasets have similar behaviour in spread of data, which indicates the validation of two datasets as two datasets are collected independently. 
+
+
+In table 1, 6 variables of interests are included, with vote intension being response and other 5 variables being independent variables. There are evidences suggesting that 5 variables of interest actually relate to response. The voter turnout in age group 18 to 24 years is only 68%, while, on the contrast, voter turnouts are greater than 78% in age groups greater than 45 years (Statistics Canada, 2020). Also, research conducted by Hatemi, P. et al, indicates gender exerts influence on the decision of voting. In study after study conducted over the last five decades, researchers find a robust positive relationship between individuals' levels of education and their likelihood of voting (Barry C. Burden, 2009). Moreover, people who are more affluent are much more likely to participate in politics than those who are less affluent (Blais 2006; Frey 1971; Leighley and Nagler 2013; Smets and van Ham 2013; Verba, Schlozman, and Brady 1995; Verba and Nie 1987; Schlozman, Brady, Verba 2018). Howard A. Scarrow has also suggested that there has been considerable variation among the province in the level of voter turnout. 
+
+###Model:
+In this report, logistic regression model is used to simulate the prediction of which party each subject would vote for, especially between Liberal and Conservative party. Logistic regression should be applied if our response in a model is a binary variable. I will build a model for each party to ‘predict’ the result in 2019 Canadian Federal Election. I first build two models for Liberal party and proceed with model selection as well as variable selection. Only difference between two models lies on whether it is grouped by cells. Cell is the combination of levels of sex and family income. Let’s name model without grouping model #1 and with grouping model #2. 
+
+Model #1:
+
+$$log\left(\frac{y_j}{1-y_j}\right)=\beta_0+\beta_{edu}\ast x_{edu}+\beta_{prov}\ast x_{prov}+\beta_{age}\ast x_{age}+\beta_{sex}\ast x_{sex}+\beta_{income}\ast x_{income}\ +\ \varepsilon$$
+
+Model #2:
+
+Level 1:  Individual Level
+$$log\left(\frac{y_j}{1-y_j}\right)=\beta_{0j}+\beta_{edu}\ast x_{edu}+\beta_{prov}\ast x_{prov}+\beta_{age}\ast x_{age}+\ \varepsilon$$
+
+where y_i represents the proportion or probability of voters in the j^{th} group who will vote for Liberal party. Similarly, \beta_{0j} represents the j^{th} group's intercept or random effect of the model and is the log-probability of voting for Liberal party. For instance, female with family income $100,000 to $125,000 would have 0.487 probability or -0.0513 log-probability more to vote for Liberal party (See Table #4 in Result section). Additionally, \beta_i represents the coefficients of corresponding explanatory variables of the model. So, for every unit increase in x_i, we expect a \beta_i increase in the log-probability of voting for Liberal party.
+
+Level 2: Group Level
+
+$$\beta_{0j}=r_{00}+r_{0j}\ast W_j+u_{0j}$$
+
+
+where $r_{0j}$ represents the log-probability of $j^{th}$ group of voting for Liberal party. $r_{00}$ represents the non-random term, the intercept of the intercept $\beta_{0j}$, in the model, which will be given by the output of fixed effects (see Table #4 in Result section). Also, it represents the log-probability of people with age less than 25 and bachelor’s degree (e.g., B.A., B.Sc., LL.B.) and currently living in Alberta (see Table #3 in Result section).  $W_j$ would be an indicator variable for each single cell group. Finally, for both individual and group level, $\epsilon$ and $u_{0j}$ are errors in each model, assumed to follow normal distribution with mean 0 and constant variance (see Table #3 in Result section for $\beta$ values).
+
+Post-stratification
+Model fitting is followed by the phase of post-stratification in MRP. Post-stratification is essentially partitioning census data based on the cell defined in the model and then applying trained model to get cell-level estimates, which are aggregated up to population level weighting each cell by its relative proportion in the population (Wang et al., 2015). With our estimates y_i, ${\hat{y}}^{PS}$, the post-stratification estimate, is defined to be:
+$${\hat{y}}^{PS}=\frac{\sum_{j=1}^{J}N_j\widehat{y_j}}{\sum_{j=1}^{J}N_j}$$
+
+###Results:
+
+Table 2: AIC and AUC of Two models
+Model	AIC	AUC
+Model #1	3164.128	0.606
+Model #2	3110.879	0.645
+
+I use two values, AIC and AUC, to test and compare models. AIC is a value that could represent the accuracy of the model under the consideration of complexity. In other words, the smaller the AIC, the more accurate and less complex the model would be. From Table 2, AIC for model #1 is 3164.128 while that for model #2 is 3110.879, which means model #2 performs better in terms of being accurate and less complex. On the other hand, AUC score ranges from 0 to 1, and it represents the probability of the correctness of the model prediction, and if AUC is 1, then this model is said to be perfect because its prediction is 100% correct, i.e., the higher AUC is, the better the model performs. AUC for model #1 is 0.606 and that for model #2 is 0.645. Therefore, model #2 would be a better choice. Thus, we apply model #2 to make prediction on the result for Conservative and Liberal party. 
+
+Since we need to ‘predict’ the results, we modeled two highly-likely-to-win parties: Liberal and Conservative, based on the actual result of 2019 Canadian Federal Election. Table 3 and Table 4 display the coefficients of each level of variable when Model #2 is applied on Liberal party. Table 5 and Table 6 display the coefficients of each level of variable when Model #2 is applied on Conservative party. Interpretation of coefficient of variable should refer to Model section
+
+We estimate that the proportion of voters in favour of voting for Liberal Party and Conservative Party to be 0.234 and 0.26, respectively. This is based off our post-stratification analysis of the proportion of voters in favour of Liberal or Conservative modelled by a logistic regression model, which accounted for age, sex, province, education, and family income. 
+
+###Discussion:
+##Summary:
+In this report, we have tried to analyze retrospectively the result of 2019 Canadian Federal Election. We have used two datasets, CES and GSS, to apply MRP. CES is used for building models while GSS is treated as a census dataset to ‘predict’ the outcome of election if ‘everyone’ has voted. In phase of building model, we have used AIC and AUC scores to test and compare models. The model with random effect shows better performance in our analysis. We then apply trained model to GSS to get population-level estimate. 
+
+##Conclusion:
+With calculation of post-stratification, we claim that Conservative Party should have won 2019 Canadian Federal Election, instead of Liberal Party in reality. This is plausible in theory based on the assumption that everyone participates in voting during Election. In 2019 Canadian Federal Election, the voter turnout is only 66% (Hayes, 2019). Thus, it is plausible to get this result if ‘everyone’ has voted. This indicates a potential and crucial factor, voter turnout, that would play an important role in election. This also directs us for a further analysis.  
+
+
+##Weakness & Next steps:
+There are some limitations to my report. First of all, size of dataset is limited. By Table 1, we see that total number of observations for two datasets are relatively small. I chose these two datasets due to computational ability of my computer. Also, small datasets are easy to reproduce the result of this report. However, large dataset definitely yields more accurate and complete results. It would be recommended to use large datasets if computational ability of computer is high. Secondly, missing values of dataset are ignored. This was chosen on purpose. This is not an ideal but efficient way to deal with missing values.  This may not lead to pervasive conclusion. Thirdly, using GSS as census data may not be feasible. It should be noted that using GSS as census dataset has its own limitations as well as advantages. The main flaw with this dataset lies on the size of it, as it only contains 30000 data, which is far below the number of populations of Canada. Also, GSS applied stratified sampling to data and treats each of the 10 provinces as a stratum. However, stratified sampling assumes homogeneous property of each stratum, which may not be the case in real world, i.e., different province may have its unique characteristics. A good way to adjust this is to use mixed-structure survey, e.g., cluster and stratified sampling. 
+
+As it may come to our attention, this report does not take the Canadian Election system into account. It is meant to elect members of the House of Commons to the 43rd Canadian Parliament. In order to do that, we need more information in terms of electoral districts. Different cities have different numbers of electoral districts. Since we only have information on the level of province, this is unachievable. If we need to be more precise, we need to collect data on the level of electoral districts. 
+
+
+
+###Reference:
+
+Stephenson, Laura B; Harell, Allison; Rubenson, Daniel; Loewen, Peter John, 2020, "2019 Canadian Election Study - Phone Survey", https://doi.org/10.7910/DVN/8RHLG1, Harvard Dataverse, V1, UNF:6:eyR28qaoYlHj9qwPWZmmVQ== [fileUNF]
+
+Little, R. J. (1993). Post-stratification: a modeler’s perspective. Journal of
+the American Statistical Association, 88, 1001–1012.
+
+2017. Public Use Microdata File Documentation And User’S Guide. [ebook] Canada: authority of the Minister responsible for Statistics Canada, pp.8-19. Available at: <https://sda-artsci-utoronto-ca.myaccess.library.utoronto.ca/sdaweb/dli2/gss/gss31/gss31/more_doc/GSS31_User_Guide.pdf> [Accessed 19 October 2020].
+
+Smith, Tom W., Davern, Michael, Freese, Jeremy, and Morgan, Stephen L., General Social Surveys, 1972-2018 [machine-readable data file] /Principal Investigator, Smith, Tom W.; Co-Principal Investigators, Michael Davern, Jeremy Freese and Stephen L. Morgan; Sponsored by National Science Foundation. --NORC ed.-- Chicago: NORC, 2019.1 data file (64,814 logical records) + 1 codebook (3,758 pp.). -- (National Data Program for the Social Sciences, no. 25).
+
+Hatemi, P., McDermott, R., Bailey, J., & Martin, N. (2012). The Different Effects of Gender and
+Sex on Vote Choice. Political Research Quarterly, 65(1), 76-92. Retrieved November 2, 2020, from
+http://www.jstor.org/stable/23209561
+
+Hodgetts, P. A. and Alexander, R. (2020). cesR: Access the CES Datasets a Little Easier. R package version 0.1.0. 
+
+Government Of Canada, S. (2020, February 26). Chart 1Voter turnout by age group, 2011, 2015 and 2019 federal elections. Retrieved December 20, 2020, from https://www150.statcan.gc.ca/n1/daily-quotidien/200226/cg-b001-eng.htm
+
+Hatemi, P., McDermott, R., Bailey, J., & Martin, N. (2012). The Different Effects of Gender and Sex on Vote Choice. Political Research Quarterly, 65(1), 76-92. Retrieved November 2, 2020, from http://www.jstor.org/stable/23209561.
+
+Barry C. Burden, The dynamic effects of education on voter turnout, Electoral Studies, Volume 28, Issue 4,
+2009, Pages 540-549, ISSN 0261-3794, https://doi.org/10.1016/j.electstud.2009.05.027. 
+
+Blais, Andr. “What affects voter turnout?” Annual Review of Political Science 9 (2006): 111-125.
+
+Frey, Bruno S. “Why do high income people participate more in politics¿‘Public Choice11, no. 1 (1971): 101-105.
+Leighley, Jan E., and Jonathan Nagler. Who votes now?:  Demographics, issues, inequality, and turnout in the United States. Princeton, NJ: Princeton University Press, 2013.
+
+Smets, Kaat, and Carolien Van Ham. “The embarrassment of riches? A meta-analysis of individual-level research on voter turnout.” Electoral Studies 32, no. 2 (2013): 344-359
+
+Verba, Sidney, Kay Lehman Schlozman, and Henry E. Brady. Voice and equality: Civic voluntarism in American politics. Harvard University Press, 1995.
+
+Verba, Sidney, and Norman H. Nie. Participation in America: Political democracy and social equality. Chicago, IL: University of Chicago Press, 1987.
+
+Schlozman, Kay Lehman, Henry E Brady and Sidney Verba. 2018. Unequal and Unrepresented: Political Inequality and the Peoples Voice in the New Gilded Age. Princeton University Press
+
+Scarrow, H. (1961). Patterns of Voter Turnout in Canada. Midwest Journal of Political Science, 5(4), 351-364. doi:10.2307/2108993
+
+Wang, W., Rothschild, D., Goel, S., and Gelman, A. (2015). Forecasting elections with non-representative polls. International Journal of Forecasting, 31(3):980–991. 
+Hayes, M. (2019, October 22). Federal election 2019: Voter turnout dips to 66 per cent compared with enthusiasm that brought Trudeau to power four years ago. Retrieved December 22, 2020, from https://www.theglobeandmail.com/politics/article-federal-election-2019-voter-turnout-dips-compared-with-enthusiasm/
+
+
+
+
+
+
+
+
